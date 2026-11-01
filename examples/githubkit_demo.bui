@@ -1,0 +1,16 @@
+Import githubkit
+
+' Read-only example. Explicitly supply API base, owner and repository.
+' The token is supplied through GITHUB_TOKEN rather than source or arguments.
+Sub Main(args As Array Of String)
+    If Array.Count(args) < 4 Then
+        Print "Usage: githubkit-demo https://api.github.com OWNER REPOSITORY"
+        Exit Sub
+    End If
+    Dim client As New GitHubClient(System.EnvironmentVariable("GITHUB_TOKEN").Or(""), args(1))
+    Dim page As GitHubIssuePage = client.ListIssues(args(2), args(3))
+    For Each issue As GitHubIssue In page.Items
+        If Not issue.IsPullRequest Then Print "#" + String.From(issue.Number) + " " + issue.Title
+    Next
+    If page.Info.HasNext Then Print "More issues available on the next page."
+End Sub

@@ -1,0 +1,503 @@
+' Synchronous GitHub REST client. Run network operations on a worker thread.
+
+Private Sub CheckText(value As String, label As String)
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) < 32 Or encoded.Item(i) = 127 Then Throw New InvalidArgumentException(label + " contains a control character")
+    Next
+End Sub
+
+Private Function Segment(value As String) As String
+    CheckText(value, "Path segment")
+    If value = "" Or value = "." Or value = ".." Or String.Contains(value, "/") Or String.Contains(value, "\\") Then Throw New InvalidArgumentException("Invalid repository path segment")
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    Dim output As String = ""
+    Dim hexDigits As String = "0123456789ABCDEF"
+    For i As Integer = 0 To encoded.Count - 1
+        Dim n As Integer = encoded.Item(i)
+        If (n >= 65 And n <= 90) Or (n >= 97 And n <= 122) Or (n >= 48 And n <= 57) Or n = 45 Or n = 46 Or n = 95 Or n = 126 Then
+            output += String.Chr(n)
+        Else
+            output += "%" + String.Substring(hexDigits, n \ 16, 1) + String.Substring(hexDigits, n Mod 16, 1)
+        End If
+    Next
+    Return output
+End Function
+
+Private Function IntegerField(item As JSONItem, key As String) As Integer
+    Dim value As JSONItem = item.Value(key)
+    If value.IsNull() Then Return 0
+    If Not value.IsNumber() Then Throw New InvalidArgumentException("Expected a numeric GitHub identifier")
+    Dim number As Double = value.AsNumber().Value
+    If number <> number Or number < 0.0 Or number > 9007199254740991.0 Then Throw New InvalidArgumentException("GitHub identifier exceeds JSON's exact integer range")
+    Dim exact As Integer = number
+    If exact <> number Then Throw New InvalidArgumentException("Expected an integer GitHub identifier")
+    Return exact
+End Function
+
+Private Function HeaderValue(connection As URLConnection, headerName As String) As String
+    For Each entry In connection.ResponseHeaders.Entries()
+        If String.LCase(entry.Key) = String.LCase(headerName) Then Return entry.Value
+    Next
+    Return ""
+End Function
+
+Private Function RepositoryRoute(owner As String, repository As String) As String
+    Return "/repos/" + Segment(owner) + "/" + Segment(repository)
+End Function
+
+Private Function ItemRoute(owner As String, repository As String, kind As String, number As Integer) As String
+    If number < 1 Then Throw New InvalidArgumentException("Issue/pull request number must be positive")
+    Return RepositoryRoute(owner, repository) + "/" + kind + "/" + String.From(number)
+End Function
+
+Private Function PageSuffix(page As Integer, perPage As Integer, state As String) As String
+    If page < 1 Or perPage < 1 Or perPage > 100 Then Throw New InvalidArgumentException("Page must be positive and perPage in 1..100")
+    Dim suffix As String = "?page=" + String.From(page) + "&per_page=" + String.From(perPage)
+    If state <> "" Then
+        If state <> "open" And state <> "closed" And state <> "all" Then Throw New InvalidArgumentException("Invalid issue state")
+        suffix += "&state=" + state
+    End If
+    Return suffix
+End Function
+
+Public Class GitHubResponseInfo
+    Public Property Status As Integer
+    Public Property RequestID As String
+    Public Property RateLimitRemaining As String
+    Public Property RateLimitReset As String
+    Public Property RetryAfter As String
+    Public Property Link As String
+
+    Internal Sub Constructor(connection As URLConnection)
+        Me.Status = connection.HTTPStatus
+        Me.RequestID = HeaderValue(connection, "X-GitHub-Request-Id")
+        Me.RateLimitRemaining = HeaderValue(connection, "X-RateLimit-Remaining")
+        Me.RateLimitReset = HeaderValue(connection, "X-RateLimit-Reset")
+        Me.RetryAfter = HeaderValue(connection, "Retry-After")
+        Me.Link = HeaderValue(connection, "Link")
+    End Sub
+End Class
+
+Public Class GitHubAPIException Inherits Exception
+    Public Property ResponseInfo As GitHubResponseInfo
+
+    Internal Sub Constructor(message As String, info As GitHubResponseInfo)
+        Super.Constructor(message, info.Status)
+        Me.ResponseInfo = info
+    End Sub
+End Class
+
+Public Class GitHubPageInfo
+    Public Property Page As Integer
+    Public Property PerPage As Integer
+    Public Property HasNext As Boolean
+    Public Property ResponseInfo As GitHubResponseInfo
+
+    Internal Sub Constructor(page As Integer, perPage As Integer, info As GitHubResponseInfo)
+        Me.Page = page
+        Me.PerPage = perPage
+        Me.ResponseInfo = info
+        For Each part As String In String.Split(info.Link, ",")
+            If String.Contains(part, "rel=\"next\"") Then Me.HasNext = True
+        Next
+    End Sub
+End Class
+
+Public Class GitHubRepository
+    Public Property RawJSON As JSONItem
+    Public Property ID As Integer
+    Public Property Name As String
+    Public Property FullName As String
+    Public Property HTMLURL As String
+    Public Property Description As String
+    Public Property DefaultBranch As String
+    Public Property IsPrivate As Boolean
+
+    Internal Sub Constructor(raw As JSONItem)
+        If Not raw.IsObject() Then Throw New InvalidArgumentException("Expected a GitHub object")
+        Me.RawJSON = raw
+        Me.ID = IntegerField(raw, "id")
+        Me.Name = raw.Value("name").AsString().Or("")
+        Me.FullName = raw.Value("full_name").AsString().Or("")
+        Me.HTMLURL = raw.Value("html_url").AsString().Or("")
+        Me.Description = raw.Value("description").AsString().Or("")
+        Me.DefaultBranch = raw.Value("default_branch").AsString().Or("")
+        Me.IsPrivate = raw.Value("private").AsBoolean().Or(False)
+    End Sub
+End Class
+
+Public Class GitHubIssue
+    Public Property RawJSON As JSONItem
+    Public Property ID As Integer
+    Public Property Number As Integer
+    Public Property Title As String
+    Public Property Body As String
+    Public Property State As String
+    Public Property HTMLURL As String
+    Public Property CreatedAt As String
+    Public Property UpdatedAt As String
+    Public Property Author As String
+    Public Property IsPullRequest As Boolean
+
+    Internal Sub Constructor(raw As JSONItem)
+        If Not raw.IsObject() Then Throw New InvalidArgumentException("Expected a GitHub object")
+        Me.RawJSON = raw
+        Me.ID = IntegerField(raw, "id")
+        Me.Number = IntegerField(raw, "number")
+        Me.Title = raw.Value("title").AsString().Or("")
+        Me.Body = raw.Value("body").AsString().Or("")
+        Me.State = raw.Value("state").AsString().Or("")
+        Me.HTMLURL = raw.Value("html_url").AsString().Or("")
+        Me.CreatedAt = raw.Value("created_at").AsString().Or("")
+        Me.UpdatedAt = raw.Value("updated_at").AsString().Or("")
+        Me.Author = raw.Value("user").Value("login").AsString().Or("")
+        Me.IsPullRequest = raw.Value("pull_request").IsObject()
+    End Sub
+End Class
+
+Public Class GitHubIssuePage
+    Public Property Items As Array Of GitHubIssue
+    Public Property Info As GitHubPageInfo
+    Public Property RawJSON As JSONItem
+
+    Internal Sub Constructor(raw As JSONItem, page As Integer, perPage As Integer, info As GitHubResponseInfo)
+        If Not raw.IsArray() Then Throw New InvalidArgumentException("Expected a GitHub array")
+        Me.RawJSON = raw
+        Me.Info = New GitHubPageInfo(page, perPage, info)
+        Dim values(0) As GitHubIssue
+        For i As Integer = 0 To raw.Count() - 1
+            Array.Append(values, New GitHubIssue(raw.ValueAt(i)))
+        Next
+        Me.Items = values
+    End Sub
+End Class
+
+Public Class GitHubComment
+    Public Property RawJSON As JSONItem
+    Public Property ID As Integer
+    Public Property Body As String
+    Public Property HTMLURL As String
+    Public Property CreatedAt As String
+    Public Property UpdatedAt As String
+    Public Property Author As String
+
+    Internal Sub Constructor(raw As JSONItem)
+        If Not raw.IsObject() Then Throw New InvalidArgumentException("Expected a GitHub object")
+        Me.RawJSON = raw
+        Me.ID = IntegerField(raw, "id")
+        Me.Body = raw.Value("body").AsString().Or("")
+        Me.HTMLURL = raw.Value("html_url").AsString().Or("")
+        Me.CreatedAt = raw.Value("created_at").AsString().Or("")
+        Me.UpdatedAt = raw.Value("updated_at").AsString().Or("")
+        Me.Author = raw.Value("user").Value("login").AsString().Or("")
+    End Sub
+End Class
+
+Public Class GitHubCommentPage
+    Public Property Items As Array Of GitHubComment
+    Public Property Info As GitHubPageInfo
+    Public Property RawJSON As JSONItem
+
+    Internal Sub Constructor(raw As JSONItem, page As Integer, perPage As Integer, info As GitHubResponseInfo)
+        If Not raw.IsArray() Then Throw New InvalidArgumentException("Expected a GitHub array")
+        Me.RawJSON = raw
+        Me.Info = New GitHubPageInfo(page, perPage, info)
+        Dim values(0) As GitHubComment
+        For i As Integer = 0 To raw.Count() - 1
+            Array.Append(values, New GitHubComment(raw.ValueAt(i)))
+        Next
+        Me.Items = values
+    End Sub
+End Class
+
+Public Class GitHubLabel
+    Public Property RawJSON As JSONItem
+    Public Property ID As Integer
+    Public Property Name As String
+    Public Property Color As String
+    Public Property Description As String
+
+    Internal Sub Constructor(raw As JSONItem)
+        If Not raw.IsObject() Then Throw New InvalidArgumentException("Expected a GitHub object")
+        Me.RawJSON = raw
+        Me.ID = IntegerField(raw, "id")
+        Me.Name = raw.Value("name").AsString().Or("")
+        Me.Color = raw.Value("color").AsString().Or("")
+        Me.Description = raw.Value("description").AsString().Or("")
+    End Sub
+End Class
+
+Public Class GitHubLabelPage
+    Public Property Items As Array Of GitHubLabel
+    Public Property Info As GitHubPageInfo
+    Public Property RawJSON As JSONItem
+
+    Internal Sub Constructor(raw As JSONItem, page As Integer, perPage As Integer, info As GitHubResponseInfo)
+        If Not raw.IsArray() Then Throw New InvalidArgumentException("Expected a GitHub array")
+        Me.RawJSON = raw
+        Me.Info = New GitHubPageInfo(page, perPage, info)
+        Dim values(0) As GitHubLabel
+        For i As Integer = 0 To raw.Count() - 1
+            Array.Append(values, New GitHubLabel(raw.ValueAt(i)))
+        Next
+        Me.Items = values
+    End Sub
+End Class
+
+Public Class GitHubMilestone
+    Public Property RawJSON As JSONItem
+    Public Property ID As Integer
+    Public Property Number As Integer
+    Public Property Title As String
+    Public Property State As String
+    Public Property Description As String
+    Public Property DueOn As String
+
+    Internal Sub Constructor(raw As JSONItem)
+        If Not raw.IsObject() Then Throw New InvalidArgumentException("Expected a GitHub object")
+        Me.RawJSON = raw
+        Me.ID = IntegerField(raw, "id")
+        Me.Number = IntegerField(raw, "number")
+        Me.Title = raw.Value("title").AsString().Or("")
+        Me.State = raw.Value("state").AsString().Or("")
+        Me.Description = raw.Value("description").AsString().Or("")
+        Me.DueOn = raw.Value("due_on").AsString().Or("")
+    End Sub
+End Class
+
+Public Class GitHubMilestonePage
+    Public Property Items As Array Of GitHubMilestone
+    Public Property Info As GitHubPageInfo
+    Public Property RawJSON As JSONItem
+
+    Internal Sub Constructor(raw As JSONItem, page As Integer, perPage As Integer, info As GitHubResponseInfo)
+        If Not raw.IsArray() Then Throw New InvalidArgumentException("Expected a GitHub array")
+        Me.RawJSON = raw
+        Me.Info = New GitHubPageInfo(page, perPage, info)
+        Dim values(0) As GitHubMilestone
+        For i As Integer = 0 To raw.Count() - 1
+            Array.Append(values, New GitHubMilestone(raw.ValueAt(i)))
+        Next
+        Me.Items = values
+    End Sub
+End Class
+
+Public Class GitHubPullRequest
+    Public Property RawJSON As JSONItem
+    Public Property ID As Integer
+    Public Property Number As Integer
+    Public Property Title As String
+    Public Property Body As String
+    Public Property State As String
+    Public Property HTMLURL As String
+    Public Property IsDraft As Boolean
+    Public Property Merged As Boolean
+    Public Property Author As String
+    Public Property HeadRef As String
+    Public Property BaseRef As String
+
+    Internal Sub Constructor(raw As JSONItem)
+        If Not raw.IsObject() Then Throw New InvalidArgumentException("Expected a GitHub object")
+        Me.RawJSON = raw
+        Me.ID = IntegerField(raw, "id")
+        Me.Number = IntegerField(raw, "number")
+        Me.Title = raw.Value("title").AsString().Or("")
+        Me.Body = raw.Value("body").AsString().Or("")
+        Me.State = raw.Value("state").AsString().Or("")
+        Me.HTMLURL = raw.Value("html_url").AsString().Or("")
+        Me.IsDraft = raw.Value("draft").AsBoolean().Or(False)
+        Me.Merged = raw.Value("merged").AsBoolean().Or(False)
+        Me.Author = raw.Value("user").Value("login").AsString().Or("")
+        Me.HeadRef = raw.Value("head").Value("ref").AsString().Or("")
+        Me.BaseRef = raw.Value("base").Value("ref").AsString().Or("")
+    End Sub
+End Class
+
+Public Class GitHubPullRequestPage
+    Public Property Items As Array Of GitHubPullRequest
+    Public Property Info As GitHubPageInfo
+    Public Property RawJSON As JSONItem
+
+    Internal Sub Constructor(raw As JSONItem, page As Integer, perPage As Integer, info As GitHubResponseInfo)
+        If Not raw.IsArray() Then Throw New InvalidArgumentException("Expected a GitHub array")
+        Me.RawJSON = raw
+        Me.Info = New GitHubPageInfo(page, perPage, info)
+        Dim values(0) As GitHubPullRequest
+        For i As Integer = 0 To raw.Count() - 1
+            Array.Append(values, New GitHubPullRequest(raw.ValueAt(i)))
+        Next
+        Me.Items = values
+    End Sub
+End Class
+
+Public Class GitHubClient
+    Private Property BaseURL As String
+    Private Property Token As String
+    Private Property VersionHeader As String
+    Private Property RequestTimeout As Integer = 30
+    Public Property LastResponse As GitHubResponseInfo
+
+    Public Sub Constructor(token As String = "", apiBase As String = "https://api.github.com", allowInsecureLoopback As Boolean = False, apiVersion As String = "2026-03-10")
+        CheckText(token, "Token")
+        CheckText(apiBase, "API base")
+        CheckText(apiVersion, "API version")
+        If String.Contains(token, " ") Then Throw New InvalidArgumentException("Token cannot contain spaces")
+        If String.Len(apiVersion) <> 10 Then Throw New InvalidArgumentException("Expected an API date version")
+        For i As Integer = 0 To String.Len(apiVersion) - 1
+            Dim ch As String = String.Substring(apiVersion, i, 1)
+            If i = 4 Or i = 7 Then
+                If ch <> "-" Then Throw New InvalidArgumentException("Invalid API date version")
+            Else
+                If Not String.Contains("0123456789", ch) Then Throw New InvalidArgumentException("Invalid API date version")
+            End If
+        Next
+        Dim prefix As Integer = 8
+        If String.StartsWith(apiBase, "http://") Then
+            prefix = 7
+        ElseIf Not String.StartsWith(apiBase, "https://") Then
+            Throw New InvalidArgumentException("HTTPS API base required")
+        End If
+        If String.Contains(apiBase, "?") Or String.Contains(apiBase, "#") Or String.Contains(apiBase, "@") Or String.Contains(apiBase, "\\") Or String.Contains(apiBase, " ") Then Throw New InvalidArgumentException("Invalid API base")
+        Dim rest As String = String.Substring(apiBase, prefix)
+        Dim slash As Integer = String.IndexOf(rest, "/")
+        Dim authority As String = rest
+        If slash >= 0 Then authority = String.Left(rest, slash)
+        If authority = "" Then Throw New InvalidArgumentException("API host is required")
+        If prefix = 7 Then
+            Dim host As String = String.LCase(String.Split(authority, ":")(0))
+            If Not allowInsecureLoopback Or (host <> "localhost" And host <> "127.0.0.1") Then Throw New InvalidArgumentException("HTTP is allowed only for explicit loopback fixtures")
+        End If
+        For Each component As String In String.Split(rest, "/")
+            If component = "." Or component = ".." Or String.Contains(component, "%") Then Throw New InvalidArgumentException("Invalid API base component")
+        Next
+        While String.EndsWith(apiBase, "/")
+            apiBase = String.Left(apiBase, String.Len(apiBase) - 1)
+        End While
+        Me.BaseURL = apiBase
+        Me.Token = token
+        Me.VersionHeader = apiVersion
+    End Sub
+
+    Public Property TimeoutSeconds As Integer
+        Get
+            Return Me.RequestTimeout
+        End Get
+        Set
+            If value < 1 Or value > 3600 Then Throw New InvalidArgumentException("Timeout must be in 1..3600 seconds")
+            Me.RequestTimeout = value
+        End Set
+    End Property
+
+    Private Function Request(method As String, route As String, payload As String) As JSONItem
+        Me.LastResponse = Nil
+        Dim connection As New URLConnection()
+        connection.Timeout = Me.RequestTimeout
+        connection.ConnectionTimeout = Me.RequestTimeout
+        connection.VerifySSL = True
+        connection.FollowRedirects = False
+        connection.RequestHeaders.Set("Accept", "application/vnd.github+json")
+        connection.RequestHeaders.Set("User-Agent", "Buoy-GitHubKit/0.1.0")
+        connection.RequestHeaders.Set("X-GitHub-Api-Version", Me.VersionHeader)
+        If Me.Token <> "" Then connection.RequestHeaders.Set("Authorization", "Bearer " + Me.Token)
+        If payload <> "" Then connection.RequestHeaders.Set("Content-Type", "application/json")
+        Dim text As String
+        Try
+            If payload = "" Then
+                text = connection.Send(method, Me.BaseURL + route)
+            Else
+                text = connection.Send(method, Me.BaseURL + route, payload)
+            End If
+        Catch e As NetworkingException
+            Throw New NetworkingException("GitHub transport failed")
+        End Try
+        Me.LastResponse = New GitHubResponseInfo(connection)
+        If Me.Token <> "" Then
+            Me.LastResponse.RequestID = String.Replace(Me.LastResponse.RequestID, Me.Token, "[redacted]")
+            Me.LastResponse.RateLimitRemaining = String.Replace(Me.LastResponse.RateLimitRemaining, Me.Token, "[redacted]")
+            Me.LastResponse.RateLimitReset = String.Replace(Me.LastResponse.RateLimitReset, Me.Token, "[redacted]")
+            Me.LastResponse.RetryAfter = String.Replace(Me.LastResponse.RetryAfter, Me.Token, "[redacted]")
+            Me.LastResponse.Link = String.Replace(Me.LastResponse.Link, Me.Token, "[redacted]")
+        End If
+        If connection.HTTPStatus < 200 Or connection.HTTPStatus >= 300 Then
+            Dim message As String = "GitHub HTTP " + String.From(connection.HTTPStatus)
+            Dim parsed As Optional Of JSONItem = Json.TryParse(text)
+            If parsed.HasValue Then
+                Dim detail As String = parsed.Value.Value("message").AsString().Or("")
+                If detail <> "" Then message += ": " + detail
+            End If
+            If Me.Token <> "" Then message = String.Replace(message, Me.Token, "[redacted]")
+            Throw New GitHubAPIException(message, Me.LastResponse)
+        End If
+        If connection.HTTPStatus = 204 Or text = "" Then Return JSONItem.Null()
+        Dim parsed As Optional Of JSONItem = Json.TryParse(text)
+        If Not parsed.HasValue Then Throw New GitHubAPIException("GitHub returned invalid JSON", Me.LastResponse)
+        Return parsed.Value
+    End Function
+
+    Public Function GetRepository(owner As String, repository As String) As GitHubRepository
+        Return New GitHubRepository(Me.Request("GET", RepositoryRoute(owner, repository), ""))
+    End Function
+
+    Public Function GetIssue(owner As String, repository As String, number As Integer) As GitHubIssue
+        Return New GitHubIssue(Me.Request("GET", ItemRoute(owner, repository, "issues", number), ""))
+    End Function
+
+    Public Function ListIssues(owner As String, repository As String, page As Integer = 1, perPage As Integer = 30, state As String = "open") As GitHubIssuePage
+        Dim raw As JSONItem = Me.Request("GET", RepositoryRoute(owner, repository) + "/issues" + PageSuffix(page, perPage, state), "")
+        Return New GitHubIssuePage(raw, page, perPage, Me.LastResponse)
+    End Function
+
+    Public Function CreateIssue(owner As String, repository As String, title As String, body As String = "") As GitHubIssue
+        If String.Trim(title) = "" Then Throw New InvalidArgumentException("Issue title is required")
+        Dim payload As JSONItem = JSONItem.NewObject()
+        payload.Value("title") = title
+        payload.Value("body") = body
+        Return New GitHubIssue(Me.Request("POST", RepositoryRoute(owner, repository) + "/issues", Json.Stringify(payload)))
+    End Function
+
+    ' PATCH payload preserves omitted vs null fields; only allowed issue fields are accepted.
+    Public Function UpdateIssue(owner As String, repository As String, number As Integer, changes As JSONItem) As GitHubIssue
+        If changes = Nil Then Throw New InvalidArgumentException("Issue changes are required")
+        If Not changes.IsObject() Or changes.Count() = 0 Then Throw New InvalidArgumentException("Issue changes must be a nonempty object")
+        For Each key As String In changes.Keys()
+            If Not Array.Contains(["title", "body", "state", "state_reason", "milestone", "labels", "assignees"], key) Then Throw New InvalidArgumentException("Unsupported issue change field: " + key)
+        Next
+        Return New GitHubIssue(Me.Request("PATCH", ItemRoute(owner, repository, "issues", number), Json.Stringify(changes)))
+    End Function
+
+    Public Function ListComments(owner As String, repository As String, number As Integer, page As Integer = 1, perPage As Integer = 30) As GitHubCommentPage
+        Dim raw As JSONItem = Me.Request("GET", ItemRoute(owner, repository, "issues", number) + "/comments" + PageSuffix(page, perPage, ""), "")
+        Return New GitHubCommentPage(raw, page, perPage, Me.LastResponse)
+    End Function
+
+    Public Function CreateComment(owner As String, repository As String, number As Integer, body As String) As GitHubComment
+        If String.Trim(body) = "" Then Throw New InvalidArgumentException("Comment body is required")
+        Dim payload As JSONItem = JSONItem.NewObject()
+        payload.Value("body") = body
+        Return New GitHubComment(Me.Request("POST", ItemRoute(owner, repository, "issues", number) + "/comments", Json.Stringify(payload)))
+    End Function
+
+    Public Sub DeleteComment(owner As String, repository As String, commentID As Integer)
+        Dim ignored As JSONItem = Me.Request("DELETE", ItemRoute(owner, repository, "issues/comments", commentID), "")
+    End Sub
+
+    Public Function ListLabels(owner As String, repository As String, page As Integer = 1, perPage As Integer = 30) As GitHubLabelPage
+        Dim raw As JSONItem = Me.Request("GET", RepositoryRoute(owner, repository) + "/labels" + PageSuffix(page, perPage, ""), "")
+        Return New GitHubLabelPage(raw, page, perPage, Me.LastResponse)
+    End Function
+
+    Public Function ListMilestones(owner As String, repository As String, page As Integer = 1, perPage As Integer = 30, state As String = "open") As GitHubMilestonePage
+        Dim raw As JSONItem = Me.Request("GET", RepositoryRoute(owner, repository) + "/milestones" + PageSuffix(page, perPage, state), "")
+        Return New GitHubMilestonePage(raw, page, perPage, Me.LastResponse)
+    End Function
+
+    Public Function ListPullRequests(owner As String, repository As String, page As Integer = 1, perPage As Integer = 30, state As String = "open") As GitHubPullRequestPage
+        Dim raw As JSONItem = Me.Request("GET", RepositoryRoute(owner, repository) + "/pulls" + PageSuffix(page, perPage, state), "")
+        Return New GitHubPullRequestPage(raw, page, perPage, Me.LastResponse)
+    End Function
+
+    Public Function GetPullRequest(owner As String, repository As String, number As Integer) As GitHubPullRequest
+        Return New GitHubPullRequest(Me.Request("GET", ItemRoute(owner, repository, "pulls", number), ""))
+    End Function
+End Class
