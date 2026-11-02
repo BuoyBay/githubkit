@@ -1,6 +1,6 @@
 # Access GitHub and GitHub Enterprise repository APIs
 
-A standalone, source-only Buoy client for GitHub and GitHub Enterprise REST APIs.
+A standalone, source-only client for GitHub and GitHub Enterprise REST APIs.
 It supports repository metadata, issues, comments, labels, milestones and pull
 request metadata. Copy `packages/githubkit-0.1.0.buipkg` into a project's
 `packages/` directory and use `Import githubkit`.
@@ -18,7 +18,7 @@ consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Import githubkit
 
 Sub Main()
@@ -55,7 +55,6 @@ On your own machine, install Buoy and run:
 buoy ai init --both
 ```
 
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

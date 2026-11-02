@@ -11,7 +11,7 @@ related: ["index.md", "api.md", "typed-api.md"]
 
 Copy the githubkit archive into packages. The example reads one page of public issues and filters pull requests from display. Replace the illustrative repository before running. Obtain any required token from your credential provider or environment, rather than embedding it in source or command-line arguments.
 
-```buoy
+```basic
 Import githubkit
 
 Sub Main()

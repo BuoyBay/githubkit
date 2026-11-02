@@ -33,5 +33,4 @@ UpdateIssue allows title, body, state, state_reason, milestone, labels, and assi
 - [Getting started](getting-started.md)
 - [API reference](api.md)
 
-
 [Full typed API: properties, parameters, defaults, and returns](typed-api.md)

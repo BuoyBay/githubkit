@@ -5,20 +5,12 @@ It supports repository metadata, issues, comments, labels, milestones and pull
 request metadata. Copy `packages/githubkit-0.1.0.buipkg` into a project's
 `packages/` directory and use `Import githubkit`.
 
-## Build and verify
+## Use in an application
 
-
-Requires Buoy 0.72+ and Python 3.9+ for the build/test helpers. No additional
-native package is required: HTTPS uses Buoy's `URLConnection`. The test runner
-checks the module, consumer and example on all six Buoy targets, compiles a
-consumer against the sealed archive, and runs deterministic loopback HTTP
-fixtures. It sends no request to GitHub or any real account. `--skip-build`
-uses an existing archive. `BUOY` selects the compiler executable.
-
-[The runnable example](../examples/githubkit_demo.bui) lists issues without
-writing anything. Supply an API base, owner and repository; an optional token
-comes from `GITHUB_TOKEN` in the process environment. Never put credentials in
-source or command-line arguments.
+Requires Buoy 0.72+. HTTPS uses the installed `URLConnection` backend.
+The [console example](../examples/githubkit_demo.bui) lists issues without
+writing. Supply its API root, owner and repository; an optional token comes from
+`GITHUB_TOKEN` in the process environment, not source or command-line arguments.
 
 ## Client and objects
 
@@ -94,5 +86,3 @@ API references: [GitHub issues](https://docs.github.com/en/rest/issues/issues),
 [milestones](https://docs.github.com/en/rest/issues/milestones),
 [pull requests](https://docs.github.com/en/rest/pulls/pulls), and
 [API versions](https://docs.github.com/en/rest/about-the-rest-api/api-versions).
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.
