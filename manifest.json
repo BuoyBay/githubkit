@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "githubkit",
   "version": "0.1.0",
-  "description": "GitHub and GitHub Enterprise REST tickets, comments, labels, milestones, repositories and pull request metadata"
+  "description": "Access GitHub and GitHub Enterprise repository APIs"
 }
