@@ -1,4 +1,4 @@
-# GitHub and GitHub Enterprise REST
+# GitHub REST client
 
 A standalone, source-only client for GitHub and GitHub Enterprise REST APIs.
 It supports repository metadata, issues, comments, labels, milestones and pull
